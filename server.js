@@ -55,57 +55,36 @@ db.collection('chats').onSnapshot(snapshot => {
       console.log(`New message in chat ${chatId} for agent ${agentId}. Unread: ${prevUnread} -> ${newUnread}`);
 
       try {
-        // Look up agent by agentId field OR by document ID (handles both cases)
-        let pushToken = null;
-
-        // First try direct document lookup (if assignedAgent is the Firebase UID)
-        const directDoc = await db.collection('agents').doc(agentId.toString()).get();
-        if (directDoc.exists && directDoc.data().pushToken) {
-          pushToken = directDoc.data().pushToken;
-        }
-
-        // If not found, query by agentId field (custom numeric ID like 14)
-        if (!pushToken) {
-          const agentQuery = await db.collection('agents')
-            .where('agentId', '==', agentId)
-            .limit(1)
-            .get();
-          if (!agentQuery.empty && agentQuery.docs[0].data().pushToken) {
-            pushToken = agentQuery.docs[0].data().pushToken;
+        // Get ALL agents that have a push token
+        const agentsSnap = await db.collection('agents').get();
+        const pushTokens = [];
+        
+        agentsSnap.forEach(doc => {
+          if (doc.data().pushToken) {
+            pushTokens.push(doc.data().pushToken);
           }
-        }
+        });
 
-        // Also try agentId as a string
-        if (!pushToken) {
-          const agentQueryStr = await db.collection('agents')
-            .where('agentId', '==', agentId.toString())
-            .limit(1)
-            .get();
-          if (!agentQueryStr.empty && agentQueryStr.docs[0].data().pushToken) {
-            pushToken = agentQueryStr.docs[0].data().pushToken;
-          }
-        }
-
-        if (!pushToken) {
-          console.log(`Agent ${agentId} does not have a pushToken. Have they logged into the new APK?`);
+        if (pushTokens.length === 0) {
+          console.log(`No agents have a pushToken saved in the database!`);
           return;
         }
 
-        // Build notification
+        // Build notifications for EVERY agent
         const title = chatData.userName || 'Customer';
         let body = chatData.lastMessage || 'New message received';
         if (body.length > 100) body = body.substring(0, 100) + '...';
 
-        const pushPayload = {
-          to: pushToken,
+        const pushPayloads = pushTokens.map(token => ({
+          to: token,
           sound: 'default',
           title: title,
           body: body,
           data: { chatId: chatId },
           channelId: 'default',
-        };
+        }));
 
-        // Send via Expo Push API
+        // Send via Expo Push API (accepts an array of messages)
         const response = await fetch('https://exp.host/--/api/v2/push/send', {
           method: 'POST',
           headers: {
@@ -113,11 +92,11 @@ db.collection('chats').onSnapshot(snapshot => {
             'Accept-encoding': 'gzip, deflate',
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify(pushPayload),
+          body: JSON.stringify(pushPayloads),
         });
 
         const receipt = await response.json();
-        console.log(`Push notification sent to agent ${agentId}:`, JSON.stringify(receipt));
+        console.log(`Broadcasted push notification to ${pushTokens.length} agents:`, JSON.stringify(receipt));
 
       } catch (error) {
         console.error("Error sending push notification:", error);
