@@ -55,16 +55,39 @@ db.collection('chats').onSnapshot(snapshot => {
       console.log(`New message in chat ${chatId} for agent ${agentId}. Unread: ${prevUnread} -> ${newUnread}`);
 
       try {
-        // Get the agent's Expo Push Token
-        const agentDoc = await db.collection('agents').doc(agentId).get();
-        if (!agentDoc.exists) {
-          console.log(`Agent doc ${agentId} not found.`);
-          return;
+        // Look up agent by agentId field OR by document ID (handles both cases)
+        let pushToken = null;
+
+        // First try direct document lookup (if assignedAgent is the Firebase UID)
+        const directDoc = await db.collection('agents').doc(agentId.toString()).get();
+        if (directDoc.exists && directDoc.data().pushToken) {
+          pushToken = directDoc.data().pushToken;
         }
 
-        const pushToken = agentDoc.data().pushToken;
+        // If not found, query by agentId field (custom numeric ID like 14)
         if (!pushToken) {
-          console.log(`Agent ${agentId} does not have a pushToken.`);
+          const agentQuery = await db.collection('agents')
+            .where('agentId', '==', agentId)
+            .limit(1)
+            .get();
+          if (!agentQuery.empty && agentQuery.docs[0].data().pushToken) {
+            pushToken = agentQuery.docs[0].data().pushToken;
+          }
+        }
+
+        // Also try agentId as a string
+        if (!pushToken) {
+          const agentQueryStr = await db.collection('agents')
+            .where('agentId', '==', agentId.toString())
+            .limit(1)
+            .get();
+          if (!agentQueryStr.empty && agentQueryStr.docs[0].data().pushToken) {
+            pushToken = agentQueryStr.docs[0].data().pushToken;
+          }
+        }
+
+        if (!pushToken) {
+          console.log(`Agent ${agentId} does not have a pushToken. Have they logged into the new APK?`);
           return;
         }
 
