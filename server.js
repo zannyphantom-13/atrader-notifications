@@ -6,13 +6,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // 2. Initialize Firebase Admin SDK
-// Render allows you to safely inject your Service Account JSON via an Environment Variable
 let serviceAccount;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   } else {
-    // Local development fallback
     serviceAccount = require('./serviceAccountKey.json');
   }
 } catch (error) {
@@ -26,90 +24,94 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// Track the boot time so we only send notifications for NEW messages
-const bootTime = admin.firestore.Timestamp.now();
-console.log(`Server started at: ${bootTime.toDate().toISOString()}`);
+// Track previous unread counts to detect increases
+const previousUnreadCounts = {};
 
-// 3. Listen to all new messages across the entire database
-db.collectionGroup('messages')
-  .where('createdAt', '>=', bootTime)
-  .onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(async (change) => {
-      // We only care about newly added messages
-      if (change.type === 'added') {
-        const message = change.doc.data();
-        
-        // Ignore messages sent by the agent
-        if (message.sender === 'agent') return;
+console.log('Server started. Listening to chats collection for new messages...');
 
-        // Path is usually: chats/{chatId}/messages/{messageId}
-        const pathSegments = change.doc.ref.path.split('/');
-        if (pathSegments.length < 3) return;
-        const chatId = pathSegments[1];
+// 3. Listen to the chats collection for unreadByAgent changes
+// No index required - this is a simple collection listener
+db.collection('chats').onSnapshot(snapshot => {
+  snapshot.docChanges().forEach(async (change) => {
+    if (change.type === 'added' || change.type === 'modified') {
+      const chatId = change.doc.id;
+      const chatData = change.doc.data();
+      const newUnread = chatData.unreadByAgent || 0;
+      const prevUnread = previousUnreadCounts[chatId] ?? null;
 
-        try {
-          // Find out which agent is assigned to this chat
-          const chatDoc = await db.collection('chats').doc(chatId).get();
-          if (!chatDoc.exists) return;
+      // Update our local tracking
+      previousUnreadCounts[chatId] = newUnread;
 
-          const chatData = chatDoc.data();
-          const agentId = chatData.assignedAgent;
-          
-          // Skip if no agent is assigned or the agent is currently looking at the chat (unread = 0)
-          if (!agentId || chatData.unreadByAgent === 0) return;
+      // Skip on first snapshot load (prevUnread is null) to avoid 
+      // sending notifications for old unread messages on startup
+      if (prevUnread === null) return;
 
-          // Get the agent's Expo Push Token
-          const agentDoc = await db.collection('agents').doc(agentId).get();
-          if (!agentDoc.exists) return;
+      // Only send a notification if the unread count INCREASED
+      if (newUnread <= prevUnread) return;
 
-          const pushToken = agentDoc.data().pushToken;
-          if (!pushToken) {
-            console.log(`Agent ${agentId} does not have a pushToken.`);
-            return;
-          }
+      const agentId = chatData.assignedAgent;
+      if (!agentId) return;
 
-          // Construct the Push Notification payload
-          const title = chatData.userName || 'Customer';
-          let body = message.text || '📷 Sent an image';
-          if (body.length > 100) body = body.substring(0, 100) + '...';
+      console.log(`New message in chat ${chatId} for agent ${agentId}. Unread: ${prevUnread} -> ${newUnread}`);
 
-          const pushPayload = {
-            to: pushToken,
-            sound: 'default',
-            title: title,
-            body: body,
-            data: { chatId: chatId },
-          };
-
-          // Send the Push Notification via Expo's API
-          const response = await fetch('https://exp.host/--/api/v2/push/send', {
-            method: 'POST',
-            headers: {
-              'Accept': 'application/json',
-              'Accept-encoding': 'gzip, deflate',
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(pushPayload),
-          });
-          
-          const receipt = await response.json();
-          console.log(`Push sent to ${agentId}:`, receipt);
-
-        } catch (error) {
-          console.error("Error processing new message:", error);
+      try {
+        // Get the agent's Expo Push Token
+        const agentDoc = await db.collection('agents').doc(agentId).get();
+        if (!agentDoc.exists) {
+          console.log(`Agent doc ${agentId} not found.`);
+          return;
         }
-      }
-    });
-  }, error => {
-    console.error("Firestore Listener Error:", error);
-  });
 
-// 4. Basic Health Check Endpoint for Render
-app.get('/', (req, res) => {
-  res.send('Atrader Notification Server is running and listening for messages!');
+        const pushToken = agentDoc.data().pushToken;
+        if (!pushToken) {
+          console.log(`Agent ${agentId} does not have a pushToken.`);
+          return;
+        }
+
+        // Build notification
+        const title = chatData.userName || 'Customer';
+        let body = chatData.lastMessage || 'New message received';
+        if (body.length > 100) body = body.substring(0, 100) + '...';
+
+        const pushPayload = {
+          to: pushToken,
+          sound: 'default',
+          title: title,
+          body: body,
+          data: { chatId: chatId },
+          channelId: 'default',
+        };
+
+        // Send via Expo Push API
+        const response = await fetch('https://exp.host/--/api/v2/push/send', {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/json',
+            'Accept-encoding': 'gzip, deflate',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(pushPayload),
+        });
+
+        const receipt = await response.json();
+        console.log(`Push notification sent to agent ${agentId}:`, JSON.stringify(receipt));
+
+      } catch (error) {
+        console.error("Error sending push notification:", error);
+      }
+    }
+  });
+}, error => {
+  console.error("Firestore chats listener error:", error);
 });
 
-// 5. Start Server
+// 4. Health Check Endpoint (keeps Render awake if pinged)
+app.get('/', (req, res) => {
+  const chatCount = Object.keys(previousUnreadCounts).length;
+  res.send(`Atrader Notification Server is running. Monitoring ${chatCount} chats.`);
+});
+
+// 5. Start the server
 app.listen(PORT, () => {
   console.log(`Listening on port ${PORT}`);
 });
