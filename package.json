@@ -1,0 +1,13 @@
+{
+  "name": "atrader-render-notifications",
+  "version": "1.0.0",
+  "description": "Standalone Node.js server for Atrader Push Notifications",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "firebase-admin": "^11.8.0"
+  }
+}
