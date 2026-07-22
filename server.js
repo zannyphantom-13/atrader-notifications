@@ -78,6 +78,7 @@ db.collection('chats').onSnapshot(snapshot => {
         const pushPayloads = pushTokens.map(token => ({
           to: token,
           sound: 'default',
+          priority: 'high',
           title: title,
           body: body,
           data: { chatId: chatId },
