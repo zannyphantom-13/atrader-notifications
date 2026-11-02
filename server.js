@@ -1,15 +1,37 @@
 const express = require('express');
 const admin = require('firebase-admin');
 
-// 1. Initialize Express App
+// 1. Process safety guards (prevents unexpected process crashes on transient network blips)
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION]', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[UNHANDLED REJECTION]', reason);
+});
+
+// 2. Initialize Express App
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 2. Initialize Firebase Admin SDK
+// 3. Initialize Firebase Admin SDK
 let serviceAccount;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    let raw = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+    // Handle optional base64 encoded credentials
+    if (!raw.startsWith('{')) {
+      try {
+        raw = Buffer.from(raw, 'base64').toString('utf-8');
+      } catch (_) {}
+    }
+    serviceAccount = JSON.parse(raw);
+    // Fix escaped newlines in private key if mangled by environment variables
+    if (serviceAccount.private_key && serviceAccount.private_key.includes('\\n')) {
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+    }
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+    serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
   } else {
     serviceAccount = require('./serviceAccountKey.json');
   }
@@ -29,9 +51,9 @@ const previousUnreadCounts = {};
 
 console.log('Server started. Listening to chats collection for new messages...');
 
-// 3. Listen to the chats collection for unreadByAgent changes
+// 4. Listen to the chats collection for unreadByAgent changes
 // No index required - this is a simple collection listener
-db.collection('chats').onSnapshot(snapshot => {
+const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
   snapshot.docChanges().forEach(async (change) => {
     if (change.type === 'added' || change.type === 'modified') {
       const chatId = change.doc.id;
@@ -108,13 +130,44 @@ db.collection('chats').onSnapshot(snapshot => {
   console.error("Firestore chats listener error:", error);
 });
 
-// 4. Health Check Endpoint (keeps Render awake if pinged)
+// 5. Health Check Endpoints (for Northflank liveness/readiness probes)
 app.get('/', (req, res) => {
   const chatCount = Object.keys(previousUnreadCounts).length;
-  res.send(`Atrader Notification Server is running. Monitoring ${chatCount} chats.`);
+  res.status(200).json({
+    status: 'ok',
+    message: `Atrader Notification Server is running. Monitoring ${chatCount} chats.`,
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
 });
 
-// 5. Start the server
-app.listen(PORT, () => {
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy', uptime: Math.floor(process.uptime()) });
+});
+
+// 6. Start the server
+const server = app.listen(PORT, () => {
   console.log(`Listening on port ${PORT}`);
 });
+
+// 7. Graceful Shutdown (allows Northflank / Kubernetes to cleanly terminate on deploy)
+function gracefulShutdown(signal) {
+  console.log(`Received ${signal}. Gracefully stopping service...`);
+  if (typeof unsubscribe === 'function') {
+    try {
+      unsubscribe();
+    } catch (_) {}
+  }
+  server.close(() => {
+    console.log('HTTP server closed. Exiting.');
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error('Forced shutdown timeout reached. Exiting.');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
