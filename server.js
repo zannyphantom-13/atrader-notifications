@@ -33,7 +33,11 @@ try {
   } else if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
     serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
   } else {
-    serviceAccount = require('./serviceAccountKey.json');
+    try {
+      serviceAccount = require('./serviceAccountKey.json');
+    } catch (_) {
+      serviceAccount = require('c:/Users/Hassan/Downloads/atrader-54ae9-firebase-adminsdk-fbsvc-6e950c5919.json');
+    }
   }
 } catch (error) {
   console.error("FATAL: Could not load Firebase Service Account credentials.", error.message);
@@ -47,82 +51,149 @@ admin.initializeApp({
 const db = admin.firestore();
 
 // Track previous unread counts to detect increases
-const previousUnreadCounts = {};
+const previousUnreadAgentCounts = {};
+const previousUnreadCustomerCounts = {};
 
 console.log('Server started. Listening to chats collection for new messages...');
 
-// 4. Listen to the chats collection for unreadByAgent changes
-// No index required - this is a simple collection listener
+// Helper to send push payloads via Expo Push API
+async function sendExpoPush(payloads) {
+  if (!payloads || (Array.isArray(payloads) && payloads.length === 0)) return;
+  const bodyData = Array.isArray(payloads) ? payloads : [payloads];
+  try {
+    const response = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Accept-encoding': 'gzip, deflate',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(bodyData),
+    });
+    const receipt = await response.json();
+    return receipt;
+  } catch (error) {
+    console.error("Error sending push notification via Expo:", error);
+  }
+}
+
+// 4. Listen to the chats collection for unread changes (both directions)
 const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
   snapshot.docChanges().forEach(async (change) => {
     if (change.type === 'added' || change.type === 'modified') {
       const chatId = change.doc.id;
       const chatData = change.doc.data();
-      const newUnread = chatData.unreadByAgent || 0;
-      const prevUnread = previousUnreadCounts[chatId] ?? null;
 
-      // Update our local tracking
-      previousUnreadCounts[chatId] = newUnread;
+      // =========================================================================
+      // DIRECTION 1: Customer sent message -> Notify ONLY the assigned support agent
+      // =========================================================================
+      const newAgentUnread = Number(chatData.unreadByAgent || 0);
+      const prevAgentUnread = previousUnreadAgentCounts[chatId] ?? null;
+      previousUnreadAgentCounts[chatId] = newAgentUnread;
 
-      // Skip on first snapshot load (prevUnread is null) to avoid 
-      // sending notifications for old unread messages on startup
-      if (prevUnread === null) return;
+      if (prevAgentUnread !== null && newAgentUnread > prevAgentUnread) {
+        const assignedAgentId = chatData.assignedAgent || chatData.assignedTo;
+        console.log(`[Customer -> Agent] Chat ${chatId} unreadByAgent: ${prevAgentUnread} -> ${newAgentUnread}. Assigned agent: ${assignedAgentId || 'Unassigned'}`);
 
-      // Only send a notification if the unread count INCREASED
-      if (newUnread <= prevUnread) return;
+        try {
+          let pushTokens = [];
 
-      const agentId = chatData.assignedAgent;
-      if (!agentId) return;
-
-      console.log(`New message in chat ${chatId} for agent ${agentId}. Unread: ${prevUnread} -> ${newUnread}`);
-
-      try {
-        // Get ALL agents that have a push token
-        const agentsSnap = await db.collection('agents').get();
-        const pushTokens = [];
-        
-        agentsSnap.forEach(doc => {
-          if (doc.data().pushToken) {
-            pushTokens.push(doc.data().pushToken);
+          if (assignedAgentId) {
+            // Target ONLY this assigned agent
+            const agentDocId = String(assignedAgentId);
+            const agentDoc = await db.collection('agents').doc(agentDocId).get();
+            if (agentDoc.exists && agentDoc.data().pushToken) {
+              pushTokens.push(agentDoc.data().pushToken);
+            } else {
+              // Fallback query by field if doc ID differs
+              const qSnap = await db.collection('agents').where('agentId', '==', agentDocId).get();
+              qSnap.forEach(d => {
+                if (d.data().pushToken) pushTokens.push(d.data().pushToken);
+              });
+            }
+          } else {
+            // Unassigned chat in queue: notify available agents
+            const agentsSnap = await db.collection('agents').get();
+            agentsSnap.forEach(d => {
+              if (d.data().pushToken) pushTokens.push(d.data().pushToken);
+            });
           }
-        });
 
-        if (pushTokens.length === 0) {
-          console.log(`No agents have a pushToken saved in the database!`);
-          return;
+          if (pushTokens.length > 0) {
+            const title = chatData.userName || 'Customer';
+            let body = chatData.lastMessage || 'New message received';
+            if (body.length > 100) body = body.substring(0, 100) + '...';
+
+            const payloads = pushTokens.map(token => ({
+              to: token,
+              sound: 'default',
+              priority: 'high',
+              title: title,
+              body: body,
+              data: { chatId: chatId },
+              channelId: 'default',
+            }));
+
+            const receipt = await sendExpoPush(payloads);
+            console.log(`[Customer -> Agent] Push sent to ${pushTokens.length} recipient(s):`, JSON.stringify(receipt));
+          } else {
+            console.log(`[Customer -> Agent] No push token found for agent ${assignedAgentId}`);
+          }
+        } catch (err) {
+          console.error("[Customer -> Agent] Error notifying agent:", err);
         }
+      }
 
-        // Build notifications for EVERY agent
-        const title = chatData.userName || 'Customer';
-        let body = chatData.lastMessage || 'New message received';
-        if (body.length > 100) body = body.substring(0, 100) + '...';
+      // =========================================================================
+      // DIRECTION 2: Agent sent message -> Notify ONLY the customer
+      // User requirement: main app notification should be "New message awaiting you"
+      // =========================================================================
+      const newCustomerUnread = Math.max(
+        Number(chatData.unreadByCustomer || 0),
+        Number(chatData.unreadByUser || 0),
+        Number(chatData.unreadCount || 0)
+      );
+      const prevCustomerUnread = previousUnreadCustomerCounts[chatId] ?? null;
+      previousUnreadCustomerCounts[chatId] = newCustomerUnread;
 
-        const pushPayloads = pushTokens.map(token => ({
-          to: token,
-          sound: 'default',
-          priority: 'high',
-          title: title,
-          body: body,
-          data: { chatId: chatId },
-          channelId: 'default',
-        }));
+      if (prevCustomerUnread !== null && newCustomerUnread > prevCustomerUnread) {
+        console.log(`[Agent -> Customer] Chat ${chatId} unreadByCustomer: ${prevCustomerUnread} -> ${newCustomerUnread}`);
 
-        // Send via Expo Push API (accepts an array of messages)
-        const response = await fetch('https://exp.host/--/api/v2/push/send', {
-          method: 'POST',
-          headers: {
-            'Accept': 'application/json',
-            'Accept-encoding': 'gzip, deflate',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(pushPayloads),
-        });
+        const customerToken = chatData.userExpoPushToken;
+        if (customerToken && customerToken.startsWith('ExponentPushToken')) {
+          const isTradeChat = !!chatData.tradeId;
+          const cardLabel = chatData.cardName || chatData.cardCategory;
+          const notifTitle = isTradeChat && cardLabel ? `Atrader — ${cardLabel}` : 'Atrader Support';
+          const notifBody = 'New message awaiting you'; // Strict user requirement
 
-        const receipt = await response.json();
-        console.log(`Broadcasted push notification to ${pushTokens.length} agents:`, JSON.stringify(receipt));
+          const payload = {
+            to: customerToken,
+            sound: 'default',
+            priority: 'high',
+            title: notifTitle,
+            body: notifBody,
+            channelId: 'chat_alerts',
+            data: {
+              chatId: chatId,
+              conversationId: chatId,
+              tradeId: chatData.tradeId || null,
+              cardName: chatData.cardName || null,
+              cardCategory: chatData.cardCategory || null,
+              senderName: notifTitle,
+              preview: notifBody,
+              screen: `/(protected)/(features)/trade-chat?chatId=${chatId}&type=existing`
+            }
+          };
 
-      } catch (error) {
-        console.error("Error sending push notification:", error);
+          try {
+            const receipt = await sendExpoPush([payload]);
+            console.log(`[Agent -> Customer] Push sent to customer ${customerToken}:`, JSON.stringify(receipt));
+          } catch (err) {
+            console.error("[Agent -> Customer] Error notifying customer:", err);
+          }
+        } else {
+          console.log(`[Agent -> Customer] Chat ${chatId} has no valid customer userExpoPushToken: ${customerToken}`);
+        }
       }
     }
   });
@@ -132,10 +203,11 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
 
 // 5. Health Check Endpoints (for Northflank liveness/readiness probes)
 app.get('/', (req, res) => {
-  const chatCount = Object.keys(previousUnreadCounts).length;
+  const agentChatCount = Object.keys(previousUnreadAgentCounts).length;
+  const customerChatCount = Object.keys(previousUnreadCustomerCounts).length;
   res.status(200).json({
     status: 'ok',
-    message: `Atrader Notification Server is running. Monitoring ${chatCount} chats.`,
+    message: `Atrader Notification Server is running. Monitoring ${agentChatCount} agent chats, ${customerChatCount} customer chats.`,
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString()
   });
