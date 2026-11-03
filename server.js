@@ -135,7 +135,7 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
               title: title,
               body: body,
               data: { chatId: chatId },
-              channelId: 'default',
+              channelId: 'chat_alerts_v2', // HIGH importance for heads-up pop-up
             }));
 
             const receipt = await sendExpoPush(payloads);
