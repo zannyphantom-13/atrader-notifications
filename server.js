@@ -112,10 +112,14 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
               });
             }
           } else {
-            // Unassigned chat in queue: notify available agents
+            // Unassigned chat in queue: only notify agents who want ALL messages
+            // (agents with 'mine_only' pref skip unassigned chats)
             const agentsSnap = await db.collection('agents').get();
             agentsSnap.forEach(d => {
-              if (d.data().pushToken) pushTokens.push(d.data().pushToken);
+              const pref = d.data().notificationPreference || 'all';
+              if (pref === 'all' && d.data().pushToken) {
+                pushTokens.push(d.data().pushToken);
+              }
             });
           }
 
