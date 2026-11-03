@@ -136,7 +136,10 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
 
           if (pushTokens.length > 0) {
             const title = chatData.userName || 'Customer';
-            let body = chatData.lastMessage || 'New message received';
+            const isFirst = newAgentUnread <= 1;
+            let body = isFirst
+              ? (chatData.lastMessage || 'New message received')
+              : `${newAgentUnread} new messages`;
             if (body.length > 100) body = body.substring(0, 100) + '...';
 
             const payloads = pushTokens.map(token => ({
@@ -147,6 +150,8 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
               body: body,
               data: { chatId: chatId },
               channelId: 'chat_alerts_v2', // HIGH importance for heads-up pop-up
+              tag: `chat_${chatId}`,
+              collapseId: `chat_${chatId}`,
             }));
 
             const receipt = await sendExpoPush(payloads);
@@ -179,7 +184,11 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
           const isTradeChat = !!chatData.tradeId;
           const cardLabel = chatData.cardName || chatData.cardCategory;
           const notifTitle = isTradeChat && cardLabel ? `Atrader — ${cardLabel}` : 'Atrader Support';
-          const notifBody = 'New message awaiting you'; // Strict user requirement
+          
+          const isFirst = newCustomerUnread <= 1;
+          const notifBody = isFirst
+            ? 'New message awaiting you'
+            : `${newCustomerUnread} new messages`;
 
           const payload = {
             to: customerToken,
@@ -188,6 +197,8 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
             title: notifTitle,
             body: notifBody,
             channelId: 'chat_alerts',
+            tag: `chat_${chatId}`,
+            collapseId: `chat_${chatId}`,
             data: {
               chatId: chatId,
               conversationId: chatId,
