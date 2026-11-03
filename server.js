@@ -176,18 +176,28 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
       const prevCustomerUnread = previousUnreadCustomerCounts[chatId] ?? null;
       previousUnreadCustomerCounts[chatId] = newCustomerUnread;
 
-      if (prevCustomerUnread !== null && newCustomerUnread > prevCustomerUnread) {
+      // STRICT CHECK: Only notify customer when message is FROM AN AGENT in a gift card trade/support chat!
+      // NEVER notify on system welcome messages, trade ongoing status, or closed chat messages.
+      const isFromAgent = chatData.lastMessageSender === 'agent' || chatData.senderType === 'agent';
+      const isSystem =
+        chatData.lastMessageSender === 'system' ||
+        chatData.senderType === 'system' ||
+        (chatData.lastMessage && chatData.lastMessage.toLowerCase().includes('ongoing')) ||
+        (chatData.lastMessage && chatData.lastMessage.toLowerCase().includes('welcome')) ||
+        (chatData.lastMessage && chatData.lastMessage.toLowerCase().includes('submitted a trade'));
+
+      if (prevCustomerUnread !== null && newCustomerUnread > prevCustomerUnread && isFromAgent && !isSystem) {
         console.log(`[Agent -> Customer] Chat ${chatId} unreadByCustomer: ${prevCustomerUnread} -> ${newCustomerUnread}`);
 
         const customerToken = chatData.userExpoPushToken;
         if (customerToken && customerToken.startsWith('ExponentPushToken')) {
           const isTradeChat = !!chatData.tradeId;
           const cardLabel = chatData.cardName || chatData.cardCategory;
-          const notifTitle = isTradeChat && cardLabel ? `Atrader — ${cardLabel}` : 'Atrader Support';
+          const notifTitle = isTradeChat && cardLabel ? `Atrader Support — ${cardLabel}` : 'Atrader Support';
           
           const isFirst = newCustomerUnread <= 1;
           const notifBody = isFirst
-            ? 'New message awaiting you'
+            ? (chatData.lastMessage || 'New message awaiting you')
             : `${newCustomerUnread} new messages`;
 
           const payload = {
