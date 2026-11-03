@@ -98,30 +98,41 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
         try {
           let pushTokens = [];
 
-          if (assignedAgentId) {
-            // Target ONLY this assigned agent
-            const agentDocId = String(assignedAgentId);
-            const agentDoc = await db.collection('agents').doc(agentDocId).get();
-            if (agentDoc.exists && agentDoc.data().pushToken) {
-              pushTokens.push(agentDoc.data().pushToken);
-            } else {
-              // Fallback query by field if doc ID differs
-              const qSnap = await db.collection('agents').where('agentId', '==', agentDocId).get();
-              qSnap.forEach(d => {
-                if (d.data().pushToken) pushTokens.push(d.data().pushToken);
-              });
-            }
-          } else {
-            // Unassigned chat in queue: only notify agents who want ALL messages
-            // (agents with 'mine_only' pref skip unassigned chats)
-            const agentsSnap = await db.collection('agents').get();
-            agentsSnap.forEach(d => {
-              const pref = d.data().notificationPreference || 'all';
-              if (pref === 'all' && d.data().pushToken) {
-                pushTokens.push(d.data().pushToken);
+          // Fetch all agents once, then apply preference rules:
+          //   assigned chat  → assigned agent always gets it
+          //                    + any other agent with pref='all' also gets it
+          //   unassigned chat → only agents with pref='all'
+          const agentsSnap = await db.collection('agents').get();
+          const seenTokens = new Set(); // deduplicate tokens
+
+          agentsSnap.forEach(d => {
+            const agentData = d.data();
+            const token = agentData.pushToken;
+            if (!token || seenTokens.has(token)) return;
+
+            const pref = agentData.notificationPreference || 'all';
+
+            if (assignedAgentId) {
+              // Is THIS agent the assigned one?
+              const thisAgentId = String(agentData.agentId || d.id);
+              const isAssignedAgent =
+                thisAgentId === String(assignedAgentId) ||
+                d.id === String(assignedAgentId);
+
+              // Assigned agent always gets notified regardless of pref.
+              // Any other agent gets notified only if pref='all'.
+              if (isAssignedAgent || pref === 'all') {
+                pushTokens.push(token);
+                seenTokens.add(token);
               }
-            });
-          }
+            } else {
+              // Unassigned chat: only agents who want ALL messages
+              if (pref === 'all') {
+                pushTokens.push(token);
+                seenTokens.add(token);
+              }
+            }
+          });
 
           if (pushTokens.length > 0) {
             const title = chatData.userName || 'Customer';
