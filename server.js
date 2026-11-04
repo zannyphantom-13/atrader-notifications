@@ -195,10 +195,7 @@ const unsubscribe = db.collection('chats').onSnapshot(snapshot => {
           const cardLabel = chatData.cardName || chatData.cardCategory;
           const notifTitle = isTradeChat && cardLabel ? `Atrader Support — ${cardLabel}` : 'Atrader Support';
           
-          const isFirst = newCustomerUnread <= 1;
-          const notifBody = isFirst
-            ? (chatData.lastMessage || 'New message awaiting you')
-            : `${newCustomerUnread} new messages`;
+          const notifBody = "New - Message awaiting you";
 
           const payload = {
             to: customerToken,
